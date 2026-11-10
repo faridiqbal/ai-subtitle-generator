@@ -44,6 +44,31 @@ Whisper sometimes confuses Malay with Indonesian. If that happens, set the sourc
 
 ---
 
+### Do I need a Hugging Face token?
+
+**No.** Whisper models are public and are downloaded from Hugging Face **once**, with a progress bar. They are stored in a plain local folder: the `whisper-models` Docker volume, or `~/.srt-translator/models` without Docker. After that the model always loads from disk, the app never contacts Hugging Face again, and transcription works completely offline. The warning *"You are sending unauthenticated requests to the HF Hub"* only meant downloads have lower rate limits without a token.
+
+Setup offers an **optional** token field (press Enter to skip) and can download the model straight away. You can also set `HF_TOKEN` in the environment.
+
+### Large and long videos (1 GB+, 2+ hours)
+
+| Concern | What the app does |
+|---|---|
+| **Huge files** | ffmpeg decodes **only the first audio track** (`-map 0:a:0 -vn`). The video picture is never decoded, so a 5 GB file costs no more than its soundtrack. A 1.6 GB test file finished audio extraction in under 1 s. |
+| **Memory on long films** | Audio is streamed in **20-minute chunks**, and each chunk is cut at the quietest moment so no word is split. RAM stays flat: in tests, a 2.5-hour file peaked at 1.1 GB with the `tiny` model, the same as an 8-minute file. |
+| **Speed** | **Batched transcription** processes several speech segments at once. In testing it was 8x faster than sequential mode (12.6 s vs 105.6 s for 8 min of audio, `tiny` model, 4 CPU cores). It uses all CPU cores, and the AI translation runs **4 requests in parallel**. |
+| **Crashes / lost connection / Ctrl+C** | Progress is saved after every audio chunk and every translation batch. Run the same file again and it **resumes** where it stopped: no re-transcribing, and no paying twice for lines already translated. The cache is in `<config dir>/cache`. |
+| **Half-written files** | Each `.srt` is written to a temporary file first and swapped in only when complete. |
+| **No audio track** | The app reports *"this file has no audio track"* and moves on to the next file. |
+
+Tuning (environment variables):
+- `SRT_PARALLEL_REQUESTS` (default `4`): lower it if you hit API rate limits, raise it for faster translation.
+- `SRT_CHUNK_SECONDS` (default `1200`): lower it to use less RAM.
+
+Rough timing on a modern 8-core CPU with `large-v3-turbo`: a 2-hour film takes about 30–60 minutes to transcribe. Translation of about 2,000 lines takes a few minutes. With an NVIDIA GPU, transcription takes only a few minutes. On Docker Desktop (Windows/macOS), give Docker at least **4 GB of memory**, or **8 GB for `large-v3`** (Settings → Resources).
+
+> **Note on the batched mode:** it requires `onnxruntime`. On Python 3.15, where onnxruntime isn't available yet, the app falls back to slower sequential mode. The Docker image always has the fast mode.
+
 ## Run with Docker (recommended)
 
 You only need [Docker](https://docs.docker.com/get-docker/). Start the launcher; it builds the image the first time:

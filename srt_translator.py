@@ -33,7 +33,18 @@ except ImportError:  # pragma: no cover
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v",
                     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
-WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
+# Whisper sizes -> public Hugging Face repos with CTranslate2 weights (approx. download size)
+WHISPER_REPOS = {
+    "tiny": ("Systran/faster-whisper-tiny", "75 MB"),
+    "base": ("Systran/faster-whisper-base", "145 MB"),
+    "small": ("Systran/faster-whisper-small", "485 MB"),
+    "medium": ("Systran/faster-whisper-medium", "1.5 GB"),
+    "large-v3": ("Systran/faster-whisper-large-v3", "3.1 GB"),
+    "large-v3-turbo": ("mobiuslabsgmbh/faster-whisper-large-v3-turbo", "1.6 GB"),
+}
+WHISPER_MODELS = list(WHISPER_REPOS)
+MODEL_FILES = re.compile(r"^(config\.json|preprocessor_config\.json|model\.bin|"
+                         r"tokenizer\.json|vocabulary\.\w+)$")
 
 LANGUAGE_NAMES = {
     "en": "English", "ms": "Malay", "id": "Indonesian", "ar": "Arabic",
@@ -57,6 +68,7 @@ PROVIDERS = {
 BATCH_SIZE = 40       # subtitle lines per translation request
 CONTEXT_LINES = 5     # previous lines sent as context for better continuity
 MAX_RETRIES = 3
+PARALLEL_REQUESTS = int(os.environ.get("SRT_PARALLEL_REQUESTS", "4"))  # concurrent AI calls
 
 
 # --------------------------------------------------------------------------- #
@@ -105,10 +117,13 @@ def format_timestamp(seconds: float) -> str:
 
 
 def write_srt(segments: list[Segment], path: Path) -> None:
-    with path.open("w", encoding="utf-8") as f:
+    """Write atomically: a crash never leaves a half-written .srt behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
             f.write(f"{i}\n{format_timestamp(seg.start)} --> {format_timestamp(seg.end)}\n"
                     f"{seg.text.strip()}\n\n")
+    tmp.replace(path)
 
 
 def collect_videos(path: Path) -> list[Path]:
@@ -123,8 +138,97 @@ def collect_videos(path: Path) -> list[Path]:
 # --------------------------------------------------------------------------- #
 # 1. Transcription (faster-whisper)
 # --------------------------------------------------------------------------- #
-def load_whisper(model_size: str, device: str):
+def models_dir() -> Path:
+    return Path(os.environ.get("SRT_MODELS_DIR", CONFIG_DIR / "models"))
+
+
+def model_path(size: str) -> Path:
+    return models_dir() / size
+
+
+def model_is_downloaded(size: str) -> bool:
+    return (model_path(size) / ".complete").exists()
+
+
+def download_model(size: str, token: str | None = None) -> Path:
+    """Download a Whisper model once into a plain local folder, with a progress bar.
+
+    Hugging Face models used here are public: a token is optional and only
+    raises download rate limits.
+    """
+    import urllib.request
+
+    from huggingface_hub import HfApi, hf_hub_url
+    from huggingface_hub.utils import logging as hf_logging
+
+    hf_logging.set_verbosity_error()            # hide the "unauthenticated requests" notice
+    repo = WHISPER_REPOS.get(size, (size, ""))[0]
+    dest = model_path(size)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nDownloading Whisper model '{size}' from huggingface.co/{repo} (one time only)")
+    info = HfApi(token=token or None).model_info(repo, files_metadata=True)
+    files = [(f.rfilename, f.size or 0) for f in info.siblings if MODEL_FILES.match(f.rfilename)]
+    with tqdm(total=sum(sz for _, sz in files), unit="B", unit_scale=True, unit_divisor=1024,
+              desc="Downloading model") as bar:
+        for name, size_bytes in files:
+            target = dest / name
+            if target.exists() and target.stat().st_size == size_bytes:
+                bar.update(size_bytes)               # already there from an earlier attempt
+                continue
+            req = urllib.request.Request(hf_hub_url(repo, name),
+                                         headers={"User-Agent": "srt-translator"})
+            if token:                                # not forwarded to the CDN redirect
+                req.add_unredirected_header("Authorization", f"Bearer {token}")
+            tmp = target.with_suffix(target.suffix + ".part")
+            with urllib.request.urlopen(req, timeout=60) as resp, tmp.open("wb") as out:
+                while chunk := resp.read(1 << 20):
+                    out.write(chunk)
+                    bar.update(len(chunk))
+            tmp.replace(target)
+    (dest / ".complete").touch()
+    print(f"Model saved to {dest}")
+    return dest
+
+
+class Spinner:
+    """Progress line with elapsed time for steps that report no percentage."""
+
+    def __init__(self, desc: str):
+        import threading
+        self.desc = desc
+        self.bar = tqdm(bar_format="{desc}", desc=desc)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = time.time()
+
+    def _show(self, status: str) -> None:
+        elapsed = tqdm.format_interval(time.time() - self._t0)
+        self.bar.set_description_str(f"{self.desc}: {status} {elapsed}", refresh=True)
+
+    def _run(self):
+        frames = "|/-\\"
+        i = 0
+        while not self._stop.wait(0.2):
+            self._show(frames[i % 4])
+            i += 1
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+        self._show("done in" if exc[0] is None else "failed after")
+        self.bar.close()
+
+
+def load_whisper(model_size: str, device: str, hf_token: str | None = None):
     from faster_whisper import WhisperModel
+
+    if not model_is_downloaded(model_size):
+        download_model(model_size, hf_token)
 
     if device == "auto":
         try:
@@ -133,27 +237,25 @@ def load_whisper(model_size: str, device: str):
         except Exception:
             device = "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
-    print(f"\nLoading Whisper model '{model_size}' on {device} ({compute_type})... "
-          "(first run downloads the model)")
-    return WhisperModel(model_size, device=device, compute_type=compute_type)
+    # Loading from the local folder: no internet connection needed from here on.
+    threads = os.cpu_count() or 4                  # faster-whisper defaults to only 4
+    with Spinner(f"\nLoading Whisper '{model_size}' into memory ({device}, {compute_type})"):
+        model = WhisperModel(str(model_path(model_size)), device=device,
+                             compute_type=compute_type, cpu_threads=threads,
+                             local_files_only=True)
+    model.srt_device = device
+    return model
 
 
-def load_audio(video: Path, sample_rate: int = 16000):
-    """Decode the audio track to 16 kHz mono float32 using the ffmpeg CLI."""
-    import shutil
+def media_duration(video: Path) -> float:
     import subprocess
-
-    import numpy as np
-
-    if not shutil.which("ffmpeg"):
-        sys.exit("ffmpeg not found - install it (https://ffmpeg.org) or use the Docker image.")
-    print("  Extracting audio...")
-    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(video), "-vn",
-           "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "-"]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0 or not proc.stdout:
-        raise RuntimeError(f"ffmpeg could not read audio: {proc.stderr.decode(errors='ignore')[-300:]}")
-    return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", str(video)],
+                             capture_output=True, text=True, timeout=60).stdout
+        return float(out.strip())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return 0.0
 
 
 def vad_available() -> bool:
@@ -162,36 +264,131 @@ def vad_available() -> bool:
     return importlib.util.find_spec("onnxruntime") is not None
 
 
-def transcribe(model, video: Path, language: str | None, task: str) -> tuple[list[Segment], str, float]:
-    use_vad = vad_available()
-    if not use_vad:
-        print("  (onnxruntime not installed - silence filtering off; "
-              "subtitles still work, timestamps may be slightly less tight)")
-    segments_iter, info = model.transcribe(
-        load_audio(video),
-        language=language,          # None = auto-detect
-        task=task,                  # "transcribe" or "translate" (to English)
-        vad_filter=use_vad,         # skip silence / music, improves timestamps
-        beam_size=5,
-    )
-    detected = info.language
-    if language is None:
-        print(f"Detected language: {lang_name(detected)} ({detected}), "
-              f"confidence {info.language_probability:.0%}")
+SAMPLE_RATE = 16000
+CHUNK_SECONDS = int(os.environ.get("SRT_CHUNK_SECONDS", 20 * 60))  # audio decoded per step
+CUT_WINDOW = 15            # look +-15 s around each chunk boundary for the quietest moment
 
-    duration = info.duration or 0.0
-    segments: list[Segment] = []
+
+def _quiet_cut(samples, target: int) -> int:
+    """Index near `target` at the quietest 0.1 s frame, so words are not cut in half."""
+    import numpy as np
+
+    frame = SAMPLE_RATE // 10
+    lo = max(target - CUT_WINDOW * SAMPLE_RATE, 0)
+    hi = min(target + CUT_WINDOW * SAMPLE_RATE, len(samples))
+    n = (hi - lo) // frame
+    if n < 2:
+        return target
+    win = samples[lo:lo + n * frame].astype(np.float32).reshape(n, frame)
+    return lo + int(np.argmin((win ** 2).mean(axis=1))) * frame + frame // 2
+
+
+def audio_chunks(video: Path, start: float = 0.0):
+    """Stream the first audio track through ffmpeg; yield (offset_s, float32 samples).
+
+    Memory stays flat however long the video is: only one chunk (~77 MB for 20 min)
+    is held at a time. The video picture is never decoded, so file size barely matters.
+    """
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found - install it (https://ffmpeg.org) or use the Docker image.")
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-threads", "0"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]                # fast seek when resuming
+    cmd += ["-i", str(video), "-map", "0:a:0", "-vn", "-sn", "-dn",
+            "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+
+    bytes_per_s = SAMPLE_RATE * 2
+    target = CHUNK_SECONDS * SAMPLE_RATE
+    need = (CHUNK_SECONDS + CUT_WINDOW) * bytes_per_s
+    offset = start
+    buf = bytearray()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        eof = False
+        while not eof:
+            data = proc.stdout.read(1 << 20)
+            eof = not data
+            buf += data
+            while len(buf) >= need or (eof and buf):
+                samples = np.frombuffer(bytes(buf), np.int16)
+                cut = len(samples) if eof and len(buf) < need else _quiet_cut(samples, target)
+                chunk = samples[:cut].astype(np.float32) / 32768.0
+                del samples
+                buf = bytearray(buf[cut * 2:])
+                yield offset, chunk
+                offset += cut / SAMPLE_RATE
+        err = proc.stderr.read().decode(errors="ignore")
+        if proc.wait() != 0 and offset == start:
+            if "matches no streams" in err:
+                raise RuntimeError("this file has no audio track")
+            raise RuntimeError(f"ffmpeg could not read audio: {err[-300:]}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def transcribe(model, video: Path, language: str | None, task: str,
+               resume: dict | None = None, on_chunk=None) -> tuple[list[Segment], str, float]:
+    """Transcribe chunk by chunk. `on_chunk(segments, next_offset, lang)` is called after each
+    chunk so an interrupted run can `resume` from the last finished chunk."""
+    use_vad = vad_available()
+    if use_vad:
+        # Batched mode: speech regions are cut out with VAD and decoded several at a
+        # time - several times faster on CPU and much more on GPU.
+        from faster_whisper import BatchedInferencePipeline
+        batch_size = 16 if getattr(model, "srt_device", "cpu") == "cuda" else 8
+        pipeline = BatchedInferencePipeline(model)
+
+        def run(audio, lang):
+            return pipeline.transcribe(audio, language=lang, task=task, beam_size=5,
+                                       batch_size=batch_size, without_timestamps=False)
+    else:
+        print("  (onnxruntime not installed - batched mode and silence filtering off; "
+              "subtitles still work, just slower)")
+
+        def run(audio, lang):
+            return model.transcribe(audio, language=lang, task=task, beam_size=5,
+                                    vad_filter=False, language_detection_segments=4)
+
+    resume = resume or {}
+    segments = [Segment(*x) for x in resume.get("segments", [])]
+    start = float(resume.get("next_offset", 0.0))
+    detected = resume.get("detected") or language
+    duration = media_duration(video)
+
     label = "Transcribing" if task == "transcribe" else "Transcribing+translating"
-    with tqdm(total=round(duration, 1), unit="s", desc=label,
-              bar_format="{desc}: {percentage:3.0f}%|{bar}| {n:.0f}/{total:.0f}s audio "
-                         "[{elapsed}<{remaining}]") as bar:
-        for seg in segments_iter:
-            text = seg.text.strip()
-            if text:
-                segments.append(Segment(seg.start, seg.end, text))
-            bar.update(round(min(seg.end, duration) - bar.n, 1))
-        bar.update(bar.total - bar.n)
-    return segments, detected, duration
+    fmt = ("{desc}: {percentage:3.0f}%|{bar}| {n:.0f}/{total:.0f}s audio [{elapsed}<{remaining}]"
+           if duration else "{desc}: {n:.0f}s audio [{elapsed}]")
+    end = start
+    with tqdm(total=round(duration) or None, initial=round(start), unit="s", desc=label,
+              bar_format=fmt) as bar:
+        for offset, audio in audio_chunks(video, start):
+            chunk_len = len(audio) / SAMPLE_RATE
+            segs_iter, info = run(audio, detected)
+            if detected is None:                       # detect once, keep for every chunk
+                detected = info.language
+                bar.write(f"Detected language: {lang_name(detected)} ({detected}), "
+                          f"confidence {info.language_probability:.0%}")
+            for seg in segs_iter:
+                text = seg.text.strip()
+                if text:
+                    segments.append(Segment(offset + seg.start,
+                                            offset + min(seg.end, chunk_len), text))
+                bar.update(max(0, round(offset + min(seg.end, chunk_len)) - bar.n))
+            del audio
+            end = offset + chunk_len
+            bar.update(max(0, round(end) - bar.n))
+            if on_chunk:
+                on_chunk(segments, end, detected)
+        if duration:
+            bar.update(max(0, bar.total - bar.n))
+    return segments, detected or "unknown", duration or end
 
 
 # --------------------------------------------------------------------------- #
@@ -328,22 +525,50 @@ class Translator:
         return next((b.text for b in response.content if b.type == "text"), "")
 
     # -- public ------------------------------------------------------------ #
-    def translate(self, segments: list[Segment], source: str, target: str) -> list[Segment]:
+    def translate(self, segments: list[Segment], source: str, target: str,
+                  done: dict[int, str] | None = None, on_progress=None) -> list[Segment]:
+        """Translate in parallel batches.
+
+        done:        translations already finished in an earlier, interrupted run
+        on_progress: called with the cumulative {line id: text} after each batch,
+                     so progress can be saved and resumed
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
         system = SYSTEM_PROMPT.format(source=source, target=target)
-        out: list[Segment] = []
-        total = len(segments)
-        with tqdm(total=total, unit="line", desc=f"Translating -> {target}",
-                  bar_format="{desc}: {percentage:3.0f}%|{bar}| {n}/{total} lines "
-                             "[{elapsed}<{remaining}]") as bar:
-            for start in range(0, total, BATCH_SIZE):
-                chunk = segments[start:start + BATCH_SIZE]
-                batch = [(start + i + 1, s.text) for i, s in enumerate(chunk)]
+        results: dict[int, str] = dict(done or {})
+        lock = threading.Lock()
+        jobs = []
+        for start in range(0, len(segments), BATCH_SIZE):
+            batch = [(start + i + 1, s.text)
+                     for i, s in enumerate(segments[start:start + BATCH_SIZE])
+                     if (start + i + 1) not in results]
+            if batch:
                 context = [s.text for s in segments[max(0, start - CONTEXT_LINES):start]]
-                result = self._translate_batch(system, batch, context)
-                for (idx, original), seg in zip(batch, chunk):
-                    out.append(Segment(seg.start, seg.end, result.get(idx, original)))
-                bar.update(len(chunk))
-        return out
+                jobs.append((batch, context))
+
+        with tqdm(total=len(segments), initial=len(results), unit="line",
+                  desc=f"Translating -> {target}",
+                  bar_format="{desc}: {percentage:3.0f}%|{bar}| {n}/{total} lines "
+                             "[{elapsed}<{remaining}]") as bar, \
+                ThreadPoolExecutor(max_workers=max(1, PARALLEL_REQUESTS)) as pool:
+            futures = {pool.submit(self._translate_batch, system, b, c): b for b, c in jobs}
+            try:
+                for fut in as_completed(futures):
+                    batch_result = fut.result()
+                    with lock:
+                        results.update(batch_result)
+                        if on_progress:
+                            on_progress(results)
+                    bar.update(len(futures[fut]))
+            except BaseException:
+                for f in futures:
+                    f.cancel()
+                raise
+
+        return [Segment(s.start, s.end, results.get(i, s.text))
+                for i, s in enumerate(segments, 1)]
 
     def _translate_batch(self, system: str, batch: list[tuple[int, str]],
                          context: list[str]) -> dict[int, str]:
@@ -377,6 +602,7 @@ CONFIG_DIR = Path(os.environ.get("SRT_CONFIG_DIR", Path.home() / ".srt-translato
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = dict(whisper_model="large-v3-turbo", device="auto", source_lang="auto",
+                      hf_token=None,
                       provider="none", model=None, api_key=None, base_url=None,
                       target="English", keep_original=False, overwrite=False)
 
@@ -407,8 +633,24 @@ def setup_wizard(current: dict | None) -> dict:
     print("\nWhisper speech-recognition model (bigger = more accurate, slower):")
     print("  tiny / base / small / medium / large-v3 / large-v3-turbo")
     print("  Tip: 'large-v3-turbo' is a good balance; 'large-v3' is the most accurate.")
+    for name, (_, size) in WHISPER_REPOS.items():
+        mark = "  [downloaded]" if model_is_downloaded(name) else ""
+        print(f"    {name:<15} ~{size}{mark}")
     whisper_model = ask("Whisper model", cur["whisper_model"], WHISPER_MODELS)
     device = ask("Device (auto / cpu / cuda)", cur["device"], ["auto", "cpu", "cuda"])
+
+    hf_token = cur.get("hf_token")
+    if not model_is_downloaded(whisper_model):
+        print("\nThe model is downloaded once from Hugging Face, then runs fully offline.")
+        print("A Hugging Face token is NOT required (the models are public); it only")
+        print("gives higher download rate limits. Get one at huggingface.co/settings/tokens")
+        hint = " (Enter = keep saved token)" if hf_token else " (optional, Enter = skip)"
+        hf_token = getpass.getpass(f"Hugging Face token, hidden{hint}: ").strip() or hf_token
+        if ask_yes_no("Download the model now?", True):
+            try:
+                download_model(whisper_model, hf_token or os.environ.get("HF_TOKEN"))
+            except Exception as exc:
+                print(f"  ! Download failed ({exc}); it will be retried on the first run.")
     source_lang = ask("Default source language code (auto, ms, ar, zh, ja, ...)",
                       cur["source_lang"]).lower()
 
@@ -419,7 +661,7 @@ def setup_wizard(current: dict | None) -> dict:
     provider, _, default_model, env_var = PROVIDERS[ask("Choose", current_key, list(PROVIDERS))]
 
     cfg = dict(DEFAULT_CONFIG, whisper_model=whisper_model, device=device,
-               source_lang=source_lang, provider=provider)
+               source_lang=source_lang, provider=provider, hf_token=hf_token)
 
     if provider in ("anthropic", "openai", "gemini"):
         same = cur["provider"] == provider
@@ -524,6 +766,22 @@ def match_owner(path: Path, like: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def cache_file(video: Path, cfg: dict, task: str) -> Path:
+    """Progress cache keyed by the file (path, size, mtime) and transcription settings."""
+    import hashlib
+    st = video.stat()
+    key = f"{video.resolve()}|{st.st_size}|{int(st.st_mtime)}|{cfg['whisper_model']}|" \
+          f"{cfg['source_lang']}|{task}"
+    return CONFIG_DIR / "cache" / (hashlib.sha1(key.encode()).hexdigest() + ".json")
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
 def process_video(video: Path, model, translator: Translator | None, cfg: dict,
                   index: int, total: int) -> None:
     out_path = video.with_suffix(".srt")
@@ -534,7 +792,35 @@ def process_video(video: Path, model, translator: Translator | None, cfg: dict,
 
     task = "translate" if cfg["provider"] == "whisper" else "transcribe"
     source = None if cfg["source_lang"] == "auto" else cfg["source_lang"]
-    segments, detected, duration = transcribe(model, video, source, task)
+    cache = cache_file(video, cfg, task)
+    state: dict = {}
+    try:
+        state = json.loads(cache.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    if "segments" in state:
+        segments = [Segment(*s) for s in state["segments"]]
+        detected, duration = state["detected"], state["duration"]
+        print(f"  Resuming: reusing earlier transcription ({len(segments)} lines, "
+              f"{lang_name(detected)}).")
+    else:
+        partial = state.get("partial")
+        if partial:
+            print(f"  Resuming transcription from {format_timestamp(partial['next_offset'])[:8]} "
+                  "(earlier run was interrupted).")
+
+        def chunk_done(segs: list[Segment], next_offset: float, lang: str | None) -> None:
+            state["partial"] = {"segments": [[s.start, s.end, s.text] for s in segs],
+                                "next_offset": next_offset, "detected": lang}
+            save_json(cache, state)
+
+        segments, detected, duration = transcribe(model, video, source, task,
+                                                  resume=partial, on_chunk=chunk_done)
+        state = {"segments": [[s.start, s.end, s.text] for s in segments],
+                 "detected": detected, "duration": duration,
+                 "translations": state.get("translations", {})}
+        save_json(cache, state)
     if not segments:
         print("  No speech detected - nothing to write.")
         return
@@ -550,7 +836,17 @@ def process_video(video: Path, model, translator: Translator | None, cfg: dict,
         if target.lower() in (detected.lower(), lang_name(detected).lower()):
             print(f"  Audio is already in {target}; skipping translation.")
         else:
-            segments = translator.translate(segments, lang_name(detected), target)
+            tkey = f"{cfg['provider']}|{cfg['model']}|{target}"
+            done = {int(k): v for k, v in state.get("translations", {}).get(tkey, {}).items()}
+            if done:
+                print(f"  Resuming translation: {len(done)}/{len(segments)} lines already done.")
+
+            def checkpoint(results: dict[int, str]) -> None:
+                state.setdefault("translations", {})[tkey] = results
+                save_json(cache, state)
+
+            segments = translator.translate(segments, lang_name(detected), target,
+                                            done=done, on_progress=checkpoint)
 
     write_srt(segments, out_path)
     match_owner(out_path, video)
@@ -620,7 +916,8 @@ def main() -> None:
             if not videos:
                 break
             if model is None:                      # load once, reuse for every file
-                model = load_whisper(cfg["whisper_model"], cfg["device"])
+                model = load_whisper(cfg["whisper_model"], cfg["device"],
+                                     cfg.get("hf_token") or os.environ.get("HF_TOKEN"))
             started = time.time()
             for i, video in enumerate(videos, 1):
                 try:
