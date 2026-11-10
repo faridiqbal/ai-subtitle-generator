@@ -138,6 +138,113 @@ def collect_videos(path: Path) -> list[Path]:
 # --------------------------------------------------------------------------- #
 # 1. Transcription (faster-whisper)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# ffmpeg: detect, and help install when missing
+# --------------------------------------------------------------------------- #
+FFMPEG: str | None = None
+FFPROBE: str | None = None
+
+
+def find_ffmpeg() -> bool:
+    """Locate ffmpeg on PATH, or the copy bundled by the imageio-ffmpeg pip package."""
+    import shutil
+    global FFMPEG, FFPROBE
+    FFMPEG, FFPROBE = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if not FFMPEG:
+        try:
+            import imageio_ffmpeg
+            FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+            FFPROBE = None
+        except Exception:
+            FFMPEG = None
+    return FFMPEG is not None
+
+
+def _system_install_command() -> tuple[str, list[str]] | None:
+    """Best ffmpeg install command for this OS's package manager, if one is present."""
+    import platform
+    import shutil
+
+    system = platform.system()
+    if system == "Windows":
+        if shutil.which("winget"):
+            return "winget", ["winget", "install", "--id", "Gyan.FFmpeg", "-e",
+                              "--accept-source-agreements", "--accept-package-agreements"]
+        if shutil.which("choco"):
+            return "Chocolatey", ["choco", "install", "ffmpeg", "-y"]
+        if shutil.which("scoop"):
+            return "Scoop", ["scoop", "install", "ffmpeg"]
+    elif system == "Darwin":
+        if shutil.which("brew"):
+            return "Homebrew", ["brew", "install", "ffmpeg"]
+    else:
+        sudo = [] if hasattr(os, "geteuid") and os.geteuid() == 0 else ["sudo"]
+        for tool, cmd in (("apt-get", ["apt-get", "install", "-y", "ffmpeg"]),
+                          ("dnf", ["dnf", "install", "-y", "ffmpeg"]),
+                          ("pacman", ["pacman", "-S", "--noconfirm", "ffmpeg"]),
+                          ("zypper", ["zypper", "install", "-y", "ffmpeg"])):
+            if shutil.which(tool):
+                if tool == "apt-get":
+                    cmd = ["sh", "-c", " ".join(sudo + ["apt-get", "update"]) + " && "
+                           + " ".join(sudo + cmd)]
+                    return tool, cmd
+                return tool, sudo + cmd
+    return None
+
+
+def _manual_instructions() -> str:
+    return ("  Windows : winget install Gyan.FFmpeg   (or download from https://www.gyan.dev/ffmpeg/builds/)\n"
+            "  macOS   : brew install ffmpeg          (Homebrew: https://brew.sh)\n"
+            "  Ubuntu  : sudo apt install ffmpeg\n"
+            "  Fedora  : sudo dnf install ffmpeg\n"
+            "  Or run the Docker version, which already includes ffmpeg.")
+
+
+def ensure_ffmpeg() -> bool:
+    """Check for ffmpeg; if missing, offer to install it. Returns True when usable."""
+    import subprocess
+
+    if find_ffmpeg():
+        return True
+    print("\n" + "-" * 64)
+    print("  ffmpeg is not installed")
+    print("-" * 64)
+    print("ffmpeg is needed to read the audio track of your videos.\n")
+    system_cmd = _system_install_command()
+    options = {"1": "Install automatically with pip (bundled ffmpeg, no admin rights needed)"}
+    if system_cmd:
+        options["2"] = f"Install system-wide with {system_cmd[0]}:  {' '.join(system_cmd[1])}"
+    options[str(len(options) + 1)] = "Show manual install instructions and exit"
+    for key, label in options.items():
+        print(f"  {key}. {label}")
+    choice = ask("Choose", "1", list(options))
+
+    if choice == "1":
+        print("\nInstalling imageio-ffmpeg (about 30 MB)...")
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "imageio-ffmpeg"])
+        if result.returncode == 0:
+            import importlib
+            importlib.invalidate_caches()
+    elif system_cmd and choice == "2":
+        print(f"\nRunning: {' '.join(system_cmd[1])}\n(you may be asked for your password)\n")
+        try:
+            subprocess.run(system_cmd[1])
+        except OSError as exc:
+            print(f"  ! Could not run the installer: {exc}")
+    else:
+        print("\nInstall ffmpeg with one of these, then start the app again:\n"
+              + _manual_instructions())
+        return False
+
+    if find_ffmpeg():
+        print(f"ffmpeg is ready: {FFMPEG}")
+        return True
+    print("\n! ffmpeg still not found. If it was just installed system-wide, open a new\n"
+          "  terminal so PATH is refreshed, then start the app again. Otherwise:\n"
+          + _manual_instructions())
+    return False
+
+
 def models_dir() -> Path:
     return Path(os.environ.get("SRT_MODELS_DIR", CONFIG_DIR / "models"))
 
@@ -250,11 +357,17 @@ def load_whisper(model_size: str, device: str, hf_token: str | None = None):
 def media_duration(video: Path) -> float:
     import subprocess
     try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                              "-of", "default=nw=1:nk=1", str(video)],
-                             capture_output=True, text=True, timeout=60).stdout
-        return float(out.strip())
-    except (ValueError, OSError, subprocess.SubprocessError):
+        if FFPROBE:
+            out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                                  "-of", "default=nw=1:nk=1", str(video)],
+                                 capture_output=True, text=True, timeout=60).stdout
+            return float(out.strip())
+        # no ffprobe (e.g. pip-bundled ffmpeg): read "Duration: 01:23:45.67" from ffmpeg -i
+        err = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video)],
+                             capture_output=True, text=True, timeout=60).stderr
+        h, m, sec = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", err).groups()
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+    except (ValueError, OSError, AttributeError, subprocess.SubprocessError):
         return 0.0
 
 
@@ -289,14 +402,13 @@ def audio_chunks(video: Path, start: float = 0.0):
     Memory stays flat however long the video is: only one chunk (~77 MB for 20 min)
     is held at a time. The video picture is never decoded, so file size barely matters.
     """
-    import shutil
     import subprocess
 
     import numpy as np
 
-    if not shutil.which("ffmpeg"):
-        sys.exit("ffmpeg not found - install it (https://ffmpeg.org) or use the Docker image.")
-    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-threads", "0"]
+    if not FFMPEG and not ensure_ffmpeg():
+        raise RuntimeError("ffmpeg is required to read audio")
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-threads", "0"]
     if start > 0:
         cmd += ["-ss", f"{start:.3f}"]                # fast seek when resuming
     cmd += ["-i", str(video), "-map", "0:a:0", "-vn", "-sn", "-dn",
@@ -889,6 +1001,8 @@ def main() -> None:
     print("  SRT Translator - video audio -> translated subtitles")
     print("=" * 64)
     try:
+        if not ensure_ffmpeg():
+            sys.exit(1)
         cfg = load_config()
         if cfg is None:
             print("\nWelcome! No configuration found - let's set things up first.")

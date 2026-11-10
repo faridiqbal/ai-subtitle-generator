@@ -142,7 +142,13 @@ The image runs on CPU. A 1-hour video with `large-v3-turbo` takes roughly real-t
 
 ## Run without Docker
 
-You need `ffmpeg` on your PATH: `apt install ffmpeg`, `brew install ffmpeg`, or `winget install ffmpeg`.
+**ffmpeg** is needed to read the audio from videos. You don't have to install it yourself: at startup the app checks for it and, if it's missing, offers:
+
+1. **Automatic install with pip.** This installs the `imageio-ffmpeg` package, which bundles a ready-made ffmpeg for Windows, macOS and Linux. No admin rights are needed. This is the default.
+2. **System-wide install** with the package manager it finds on your computer: `winget`, Chocolatey or Scoop on Windows, Homebrew on macOS, or apt, dnf, pacman or zypper on Linux.
+3. **Manual instructions.**
+
+The Docker image already includes ffmpeg.
 
 **Python 3.10 – 3.14**
 
