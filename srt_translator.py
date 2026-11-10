@@ -502,30 +502,91 @@ def fix_timing(lines: list[Segment]) -> list[Segment]:
     return lines
 
 
+# Phrases Whisper is known to invent over music, noise or silence (from its training
+# data: video outros). People also say them for real ("terima kasih kerana menonton" at
+# the end of a video), so a phrase is only treated as a hallucination when it keeps
+# repeating through the same video.
+HALLUCINATIONS = [
+    "terima kasih kerana menonton", "terima kasih kerana menonton video ini",
+    "terima kasih kerana menonton dan jangan lupa subscribe", "sila langgan", "jangan lupa subscribe",
+    "terima kasih telah menonton", "terima kasih sudah menonton",
+    "thanks for watching", "thank you for watching", "please subscribe",
+    "subtitles by the amaraorg community", "like and subscribe",
+    "ご視聴ありがとうございました", "チャンネル登録をお願いします",
+    "谢谢观看", "謝謝觀看", "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", "字幕由amaraorg社区提供",
+    "شكرا للمشاهدة", "اشتركوا في القناة",
+]
+_HALLU = {re.sub(r"[\W_]+", "", h.lower()) for h in HALLUCINATIONS}
+
+
+HALLUCINATION_REPEATS = 2
+
+
+def drop_hallucination_loops(lines: list[Segment]) -> list[Segment]:
+    """Remove stock outro phrases that appear HALLUCINATION_REPEATS+ times in one video."""
+    from collections import Counter
+
+    key = lambda t: re.sub(r"[\W_]+", "", t.lower())
+    counts = Counter(key(s.text) for s in lines if key(s.text) in _HALLU)
+    loops = {k for k, c in counts.items() if c >= HALLUCINATION_REPEATS}
+    return [s for s in lines if key(s.text) not in loops]
+
+
+# Speech sensitivity -> Silero VAD threshold (lower = catches quieter speech).
+# Measured on a noisy test clip: 0.5 (library default) dropped half of the quiet lines
+# before Whisper ever heard them; 0.15 recovered them without adding false lines.
+SENSITIVITY = {"normal": 0.5, "high": 0.3, "max": 0.15}
+WINDOW_SECONDS = 15        # window size when onnxruntime (VAD) is unavailable
+
+
+def fixed_windows(audio, size: float = WINDOW_SECONDS) -> list[dict]:
+    """Split audio into ~size-second windows cut at the quietest moment (no VAD needed)."""
+    import numpy as np
+
+    sr, n = SAMPLE_RATE, len(audio)
+    frame, out, start = SAMPLE_RATE // 10, [], 0
+    while start < n:
+        target = start + int(size * sr)
+        if target >= n - sr:
+            out.append({"start": start / sr, "end": n / sr})
+            break
+        lo, hi = max(target - 2 * sr, start + sr), min(target + 2 * sr, n)
+        k = (hi - lo) // frame
+        energy = (audio[lo:lo + k * frame].reshape(k, frame) ** 2).mean(axis=1)
+        cut = lo + int(np.argmin(energy)) * frame + frame // 2
+        out.append({"start": start / sr, "end": cut / sr})
+        start = cut
+    return out
+
+
 def transcribe(model, video: Path, language: str | None, task: str,
-               resume: dict | None = None, on_chunk=None) -> tuple[list[Segment], str, float]:
+               resume: dict | None = None, on_chunk=None,
+               vad_threshold: float = SENSITIVITY["max"]) -> tuple[list[Segment], str, float]:
     """Transcribe chunk by chunk. `on_chunk(segments, next_offset, lang)` is called after each
     chunk so an interrupted run can `resume` from the last finished chunk."""
-    use_vad = vad_available()
-    if use_vad:
-        # Batched mode: speech regions are cut out with VAD and decoded several at a
-        # time - several times faster on CPU and much more on GPU.
-        from faster_whisper import BatchedInferencePipeline
-        batch_size = 16 if getattr(model, "srt_device", "cpu") == "cuda" else 8
-        pipeline = BatchedInferencePipeline(model)
+    from faster_whisper import BatchedInferencePipeline
+
+    # Always batched: Whisper decodes short pieces several at a time. (Plain sequential
+    # decoding of long 30 s windows made large-v3-turbo skip most lines in testing.)
+    batch_size = 16 if getattr(model, "srt_device", "cpu") == "cuda" else 8
+    pipeline = BatchedInferencePipeline(model)
+    common = dict(task=task, beam_size=5, batch_size=batch_size,
+                  without_timestamps=False, word_timestamps=True)
+    if vad_available():
+        from faster_whisper.vad import VadOptions
+        vad = VadOptions(threshold=vad_threshold, min_silence_duration_ms=160,
+                         max_speech_duration_s=30)
 
         def run(audio, lang):
-            return pipeline.transcribe(audio, language=lang, task=task, beam_size=5,
-                                       batch_size=batch_size, without_timestamps=False,
-                                       word_timestamps=True)
+            return pipeline.transcribe(audio, language=lang, vad_filter=True,
+                                       vad_parameters=vad, **common)
     else:
-        print("  (onnxruntime not installed - batched mode and silence filtering off; "
-              "subtitles still work, just slower)")
+        print("  (onnxruntime not installed - using fixed 15 s windows instead of "
+              "voice detection; works, but slightly less accurate on quiet speech)")
 
         def run(audio, lang):
-            return model.transcribe(audio, language=lang, task=task, beam_size=5,
-                                    vad_filter=False, language_detection_segments=4,
-                                    word_timestamps=True)
+            return pipeline.transcribe(audio, language=lang, vad_filter=False,
+                                       clip_timestamps=fixed_windows(audio), **common)
 
     resume = resume or {}
     segments = [Segment(*x) for x in resume.get("segments", [])]
@@ -556,7 +617,7 @@ def transcribe(model, video: Path, language: str | None, task: str,
                 on_chunk(segments, end, detected)
         if duration:
             bar.update(max(0, bar.total - bar.n))
-    return fix_timing(segments), detected or "unknown", duration or end
+    return fix_timing(drop_hallucination_loops(segments)), detected or "unknown", duration or end
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +831,7 @@ CONFIG_DIR = Path(os.environ.get("SRT_CONFIG_DIR", Path.home() / ".srt-translato
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = dict(whisper_model="large-v3-turbo", device="auto", source_lang="auto",
+                      sensitivity="max",
                       hf_token=None,
                       provider="none", model=None, api_key=None, base_url=None,
                       target="English", keep_original=False, overwrite=False)
@@ -821,6 +883,11 @@ def setup_wizard(current: dict | None) -> dict:
                 print(f"  ! Download failed ({exc}); it will be retried on the first run.")
     source_lang = ask("Default source language code (auto, ms, ar, zh, ja, ...)",
                       cur["source_lang"]).lower()
+    print("\nSpeech detection sensitivity:")
+    print("  max    - catches quiet and short speech (recommended)")
+    print("  high   - in between")
+    print("  normal - only clear speech (use if you get subtitles over music/noise)")
+    sensitivity = ask("Sensitivity", cur.get("sensitivity", "max"), list(SENSITIVITY))
 
     print("\nTranslation engine:")
     for key, (_, label, model, _) in PROVIDERS.items():
@@ -829,7 +896,8 @@ def setup_wizard(current: dict | None) -> dict:
     provider, _, default_model, env_var = PROVIDERS[ask("Choose", current_key, list(PROVIDERS))]
 
     cfg = dict(DEFAULT_CONFIG, whisper_model=whisper_model, device=device,
-               source_lang=source_lang, provider=provider, hf_token=hf_token)
+               source_lang=source_lang, provider=provider, hf_token=hf_token,
+               sensitivity=sensitivity)
 
     if provider in ("anthropic", "openai", "gemini"):
         same = cur["provider"] == provider
@@ -859,6 +927,7 @@ def describe(cfg: dict) -> str:
     engine = {"anthropic": "Claude", "openai": "OpenAI-compatible", "gemini": "Gemini",
               "whisper": "Whisper built-in (-> English)", "none": "no translation"}
     s = (f"Whisper: {cfg['whisper_model']} on {cfg['device']} | source: {cfg['source_lang']} | "
+         f"sensitivity: {cfg.get('sensitivity', 'max')} | "
          f"engine: {engine[cfg['provider']]}")
     if cfg["model"]:
         s += f" ({cfg['model']}) -> {cfg['target']}"
@@ -934,7 +1003,7 @@ def match_owner(path: Path, like: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-CACHE_VERSION = 2   # bump when subtitle timing logic changes so old caches are not reused
+CACHE_VERSION = 3   # bump when subtitle timing logic changes so old caches are not reused
 
 
 def cache_file(video: Path, cfg: dict, task: str) -> Path:
@@ -942,7 +1011,7 @@ def cache_file(video: Path, cfg: dict, task: str) -> Path:
     import hashlib
     st = video.stat()
     key = f"v{CACHE_VERSION}|{video.resolve()}|{st.st_size}|{int(st.st_mtime)}|" \
-          f"{cfg['whisper_model']}|{cfg['source_lang']}|{task}"
+          f"{cfg['whisper_model']}|{cfg['source_lang']}|{task}|{cfg.get('sensitivity')}"
     return CONFIG_DIR / "cache" / (hashlib.sha1(key.encode()).hexdigest() + ".json")
 
 
@@ -986,8 +1055,9 @@ def process_video(video: Path, model, translator: Translator | None, cfg: dict,
                                 "next_offset": next_offset, "detected": lang}
             save_json(cache, state)
 
-        segments, detected, duration = transcribe(model, video, source, task,
-                                                  resume=partial, on_chunk=chunk_done)
+        segments, detected, duration = transcribe(
+            model, video, source, task, resume=partial, on_chunk=chunk_done,
+            vad_threshold=SENSITIVITY.get(cfg.get("sensitivity", "max"), 0.15))
         state = {"segments": [[s.start, s.end, s.text] for s in segments],
                  "detected": detected, "duration": duration,
                  "translations": state.get("translations", {})}

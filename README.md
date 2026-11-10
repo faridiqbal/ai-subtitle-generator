@@ -55,6 +55,26 @@ A new line is started when:
 
 Each line stays visible for at least 0.8 s, and lines never overlap.
 
+### Missed speech (quiet or short lines)
+
+I tested this with a noisy 66-second clip: 24 lines, from single words to full sentences, at volumes from normal down to −36 dB, over music and noise. I found and fixed two causes:
+
+1. **The voice detector was too strict.** At its default threshold (0.5), the voice detector (Silero VAD) discarded about half of the quiet lines before Whisper ever heard them. The default is now **0.15**: more lines caught, and no false lines in the test.
+2. **Whisper skipped lines in long windows.** Plain sequential decoding of 30-second windows made `large-v3-turbo` get only 2 of 24 lines right, losing even full-volume lines like "Tolong!". The app now always decodes short pieces in batches, which got 11 of 24 right.
+
+Setup has a **speech sensitivity** option:
+
+| Setting | Use when |
+|---|---|
+| `max` (default) | You want quiet and short speech caught |
+| `high` | In between |
+| `normal` | You see subtitles appearing over music or noise |
+
+Limits worth knowing:
+- Speech that is quieter than the background music or noise is still missed. That is a limit of the Whisper models, and `large-v3` did no better than `large-v3-turbo` in the test.
+- Whisper usually leaves out filler sounds like "hmm" or "oh".
+- Whisper sometimes invents outro phrases over music, such as "Terima kasih kerana menonton", "Thanks for watching" or "ご視聴ありがとうございました". If the same stock phrase appears **twice or more** in one video, those lines are removed. A single real one, like the actual goodbye at the end of a video, is kept.
+
 ### Do I need a Hugging Face token?
 
 **No.** Whisper models are public and are downloaded from Hugging Face **once**, with a progress bar. They are stored in a plain local folder: the `whisper-models` Docker volume, or `~/.srt-translator/models` without Docker. After that the model always loads from disk, the app never contacts Hugging Face again, and transcription works completely offline. The warning *"You are sending unauthenticated requests to the HF Hub"* only meant downloads have lower rate limits without a token.
@@ -78,7 +98,7 @@ Tuning (environment variables):
 
 Rough timing on a modern 8-core CPU with `large-v3-turbo`: a 2-hour film takes about 30–60 minutes to transcribe. Translation of about 2,000 lines takes a few minutes. With an NVIDIA GPU, transcription takes only a few minutes. On Docker Desktop (Windows/macOS), give Docker at least **4 GB of memory**, or **8 GB for `large-v3`** (Settings → Resources).
 
-> **Note on the batched mode:** it requires `onnxruntime`. On Python 3.15, where onnxruntime isn't available yet, the app falls back to slower sequential mode. The Docker image always has the fast mode.
+> **Note on Python 3.15:** onnxruntime isn't available there yet, so the app can't use the voice detector. It still runs in fast batched mode, cutting the audio into 15-second windows at quiet moments instead. In tests that caught the same number of lines, but it missed some very quiet short words that the voice detector catches. For best results, use Docker or Python 3.10–3.14.
 
 ## Run with Docker (recommended)
 
