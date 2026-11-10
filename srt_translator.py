@@ -156,12 +156,22 @@ def load_audio(video: Path, sample_rate: int = 16000):
     return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
 
 
+def vad_available() -> bool:
+    """Silence filtering (VAD) needs onnxruntime, which has no wheels for every Python."""
+    import importlib.util
+    return importlib.util.find_spec("onnxruntime") is not None
+
+
 def transcribe(model, video: Path, language: str | None, task: str) -> tuple[list[Segment], str, float]:
+    use_vad = vad_available()
+    if not use_vad:
+        print("  (onnxruntime not installed - silence filtering off; "
+              "subtitles still work, timestamps may be slightly less tight)")
     segments_iter, info = model.transcribe(
         load_audio(video),
         language=language,          # None = auto-detect
         task=task,                  # "transcribe" or "translate" (to English)
-        vad_filter=True,            # skip silence / music, improves timestamps
+        vad_filter=use_vad,         # skip silence / music, improves timestamps
         beam_size=5,
     )
     detected = info.language

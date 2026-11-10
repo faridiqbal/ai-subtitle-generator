@@ -117,11 +117,33 @@ The image runs on CPU. A 1-hour video with `large-v3-turbo` takes roughly real-t
 
 ## Run without Docker
 
-You need Python 3.10 or newer and `ffmpeg` on your PATH (`apt install ffmpeg`, `brew install ffmpeg`, or `winget install ffmpeg`).
+You need `ffmpeg` on your PATH: `apt install ffmpeg`, `brew install ffmpeg`, or `winget install ffmpeg`.
+
+**Python 3.10 – 3.14**
 
 ```bash
 pip install -r requirements.txt
 ```
+
+**Python 3.15 or newer**
+
+onnxruntime does not publish wheels for Python 3.15 yet. faster-whisper requires it, so a plain `pip install` fails with *"Cannot install ... conflicting dependencies"*. Install faster-whisper without its dependencies, then add the rest:
+
+```bash
+pip install --no-deps faster-whisper
+```
+
+```bash
+pip install -r requirements-py315.txt
+```
+
+The app detects that onnxruntime is missing and turns off silence filtering (VAD). Subtitles still work, but timestamps around long pauses or music can be a bit looser. For full quality, use Docker (Python 3.12 inside the image) or a Python 3.13 virtual environment, for example with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv venv --python 3.13 && source .venv/bin/activate && uv pip install -r requirements.txt
+```
+
+Then run:
 
 ```bash
 python srt_translator.py
