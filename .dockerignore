@@ -1,0 +1,6 @@
+videos/
+*.mp4
+*.mkv
+*.srt
+.git
+__pycache__

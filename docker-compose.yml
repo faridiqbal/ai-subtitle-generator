@@ -1,0 +1,21 @@
+services:
+  srt-translator:
+    build: .
+    image: srt-translator
+    stdin_open: true   # interactive prompts
+    tty: true          # progress bars
+    volumes:
+      - ./videos:/videos          # put your videos here; .srt files are written next to them
+      - srt-config:/config        # saved settings from the first-run setup
+      - whisper-models:/models    # Whisper model cache (downloaded once)
+    # Optional: pass API keys from your shell / .env instead of saving them in the config
+    environment:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - GEMINI_API_KEY
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama etc. running on the host
+
+volumes:
+  srt-config:
+  whisper-models:

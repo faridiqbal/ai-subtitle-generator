@@ -1,0 +1,6 @@
+faster-whisper>=1.1.0   # local speech-to-text: language detection + timestamps
+numpy>=1.24             # audio samples
+tqdm>=4.66              # progress bars
+anthropic>=1.0          # Claude translation
+openai>=1.40            # OpenAI / OpenAI-compatible translation
+google-genai>=1.0       # Gemini translation
