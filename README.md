@@ -44,6 +44,17 @@ Whisper sometimes confuses Malay with Indonesian. If that happens, set the sourc
 
 ---
 
+### Subtitle timing
+
+Each subtitle line is timed by Whisper's **word timestamps**. A line starts at its first word and ends at its last word, plus 0.3 s so it doesn't vanish abruptly. Subtitles therefore disappear when the speech stops instead of staying on screen through silence or music.
+
+A new line is started when:
+- there is a pause of 0.6 s or more,
+- a sentence ends, or
+- a line would exceed about 2 rows (84 characters) or 7 seconds.
+
+Each line stays visible for at least 0.8 s, and lines never overlap.
+
 ### Do I need a Hugging Face token?
 
 **No.** Whisper models are public and are downloaded from Hugging Face **once**, with a progress bar. They are stored in a plain local folder: the `whisper-models` Docker volume, or `~/.srt-translator/models` without Docker. After that the model always loads from disk, the app never contacts Hugging Face again, and transcription works completely offline. The warning *"You are sending unauthenticated requests to the HF Hub"* only meant downloads have lower rate limits without a token.

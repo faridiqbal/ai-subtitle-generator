@@ -356,6 +356,8 @@ def load_whisper(model_size: str, device: str, hf_token: str | None = None):
 
 def media_duration(video: Path) -> float:
     import subprocess
+    if not FFMPEG and not find_ffmpeg():
+        return 0.0
     try:
         if FFPROBE:
             out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
@@ -406,7 +408,7 @@ def audio_chunks(video: Path, start: float = 0.0):
 
     import numpy as np
 
-    if not FFMPEG and not ensure_ffmpeg():
+    if not FFMPEG and not find_ffmpeg() and not ensure_ffmpeg():
         raise RuntimeError("ffmpeg is required to read audio")
     cmd = [FFMPEG, "-nostdin", "-v", "error", "-threads", "0"]
     if start > 0:
@@ -445,6 +447,61 @@ def audio_chunks(video: Path, start: float = 0.0):
             proc.wait()
 
 
+# Subtitle line rules (common broadcast guidelines)
+MAX_LINE_CHARS = 84        # about two rows of 42 characters
+MAX_LINE_SECONDS = 7.0     # longest time one subtitle stays on screen
+SPLIT_PAUSE = 0.6          # a silence this long between words starts a new subtitle
+MAX_WORD_SECONDS = 1.5     # Whisper sometimes stretches a word over the following silence
+END_PADDING = 0.3          # keep text visible a moment after the last word
+MIN_DURATION = 0.8         # shortest time a subtitle is shown (readability)
+SENTENCE_END = tuple(".?!。？！…")
+
+
+def segment_to_lines(seg, offset: float, chunk_len: float) -> list[Segment]:
+    """Turn one Whisper segment into subtitle lines timed by its words.
+
+    Each line starts at its first word and ends at its last word, so subtitles
+    disappear when the speech stops instead of lingering through silence.
+    """
+    words = [w for w in (getattr(seg, "words", None) or []) if w.word.strip()]
+    if not words:                                   # no word timing: fall back
+        text = seg.text.strip()
+        return [Segment(offset + seg.start, offset + min(seg.end, chunk_len), text)] if text else []
+
+    lines: list[list] = []
+    current: list = []
+    for w in words:
+        if current:
+            text_len = len("".join(x.word for x in current + [w]).strip())
+            if (w.start - current[-1].end >= SPLIT_PAUSE
+                    or text_len > MAX_LINE_CHARS
+                    or w.end - current[0].start > MAX_LINE_SECONDS
+                    or current[-1].word.strip().endswith(SENTENCE_END)):
+                lines.append(current)
+                current = []
+        current.append(w)
+    if current:
+        lines.append(current)
+
+    out = []
+    for ws in lines:
+        text = "".join(w.word for w in ws).strip()
+        last = ws[-1]
+        end = min(last.end, last.start + MAX_WORD_SECONDS)
+        out.append(Segment(offset + ws[0].start, offset + min(end, chunk_len), text))
+    return out
+
+
+def fix_timing(lines: list[Segment]) -> list[Segment]:
+    """Pad ends slightly, enforce a readable minimum duration, never overlap."""
+    lines = sorted((s for s in lines if s.text), key=lambda s: s.start)
+    for i, s in enumerate(lines):
+        next_start = lines[i + 1].start if i + 1 < len(lines) else float("inf")
+        end = max(s.end + END_PADDING, s.start + MIN_DURATION)
+        s.end = max(min(end, next_start - 0.04), s.start + 0.1)
+    return lines
+
+
 def transcribe(model, video: Path, language: str | None, task: str,
                resume: dict | None = None, on_chunk=None) -> tuple[list[Segment], str, float]:
     """Transcribe chunk by chunk. `on_chunk(segments, next_offset, lang)` is called after each
@@ -459,14 +516,16 @@ def transcribe(model, video: Path, language: str | None, task: str,
 
         def run(audio, lang):
             return pipeline.transcribe(audio, language=lang, task=task, beam_size=5,
-                                       batch_size=batch_size, without_timestamps=False)
+                                       batch_size=batch_size, without_timestamps=False,
+                                       word_timestamps=True)
     else:
         print("  (onnxruntime not installed - batched mode and silence filtering off; "
               "subtitles still work, just slower)")
 
         def run(audio, lang):
             return model.transcribe(audio, language=lang, task=task, beam_size=5,
-                                    vad_filter=False, language_detection_segments=4)
+                                    vad_filter=False, language_detection_segments=4,
+                                    word_timestamps=True)
 
     resume = resume or {}
     segments = [Segment(*x) for x in resume.get("segments", [])]
@@ -488,10 +547,7 @@ def transcribe(model, video: Path, language: str | None, task: str,
                 bar.write(f"Detected language: {lang_name(detected)} ({detected}), "
                           f"confidence {info.language_probability:.0%}")
             for seg in segs_iter:
-                text = seg.text.strip()
-                if text:
-                    segments.append(Segment(offset + seg.start,
-                                            offset + min(seg.end, chunk_len), text))
+                segments.extend(segment_to_lines(seg, offset, chunk_len))
                 bar.update(max(0, round(offset + min(seg.end, chunk_len)) - bar.n))
             del audio
             end = offset + chunk_len
@@ -500,7 +556,7 @@ def transcribe(model, video: Path, language: str | None, task: str,
                 on_chunk(segments, end, detected)
         if duration:
             bar.update(max(0, bar.total - bar.n))
-    return segments, detected or "unknown", duration or end
+    return fix_timing(segments), detected or "unknown", duration or end
 
 
 # --------------------------------------------------------------------------- #
@@ -878,12 +934,15 @@ def match_owner(path: Path, like: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+CACHE_VERSION = 2   # bump when subtitle timing logic changes so old caches are not reused
+
+
 def cache_file(video: Path, cfg: dict, task: str) -> Path:
     """Progress cache keyed by the file (path, size, mtime) and transcription settings."""
     import hashlib
     st = video.stat()
-    key = f"{video.resolve()}|{st.st_size}|{int(st.st_mtime)}|{cfg['whisper_model']}|" \
-          f"{cfg['source_lang']}|{task}"
+    key = f"v{CACHE_VERSION}|{video.resolve()}|{st.st_size}|{int(st.st_mtime)}|" \
+          f"{cfg['whisper_model']}|{cfg['source_lang']}|{task}"
     return CONFIG_DIR / "cache" / (hashlib.sha1(key.encode()).hexdigest() + ".json")
 
 
