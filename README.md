@@ -46,8 +46,48 @@ Whisper sometimes confuses Malay with Indonesian. If that happens, set the sourc
 
 ## Run with Docker (recommended)
 
-1. Put your videos in a `videos/` folder next to `docker-compose.yml`.
-2. Build and run:
+You only need [Docker](https://docs.docker.com/get-docker/). Start the launcher; it builds the image the first time:
+
+**Linux / macOS**
+
+```bash
+./run.sh
+```
+
+**Windows** (Command Prompt or PowerShell)
+
+```bat
+run.bat
+```
+
+What happens:
+
+1. **First run:** a setup wizard asks for the Whisper model, source and target language, translation engine, model name and API key (input hidden). The settings are saved in the `srt-config` Docker volume.
+2. The app asks for the **path of a video file or folder on your computer**. Type it, paste it, or drag the file into the terminal:
+   ```
+   Path to a video file or folder on your computer (inside /home/farid)
+   (drag & drop works; Enter = quit): /home/farid/Videos/drama ep1.mp4
+   ```
+   On Windows, type a path like `C:\Users\Farid\Videos\drama ep1.mp4`. `~/Videos` also works.
+3. It transcribes and translates the video with progress bars, then writes `drama ep1.srt` **next to the original file on your computer**.
+4. It asks for the next path. The Whisper model stays loaded, so later files start faster. Press Enter on an empty line to quit.
+
+Useful variations:
+
+| Goal | Linux / macOS | Windows |
+|---|---|---|
+| Change settings | `./run.sh --setup` | `run.bat --setup` |
+| Process one path and exit | `./run.sh "/home/me/Videos/ep1.mp4"` | `run.bat "C:\Users\me\Videos\ep1.mp4"` |
+| Videos outside your home folder | `HOST_ROOT=/mnt/media ./run.sh` | `set HOST_ROOT=D:\Movies` then `run.bat` |
+| Rebuild after updating the code | `REBUILD=1 ./run.sh` | `set REBUILD=1` then `run.bat` |
+
+### How the host path works
+
+A container can only see the folders you share with it. The launcher shares `HOST_ROOT` with the container (read-write, so the `.srt` can be saved), mounted at `/host`. By default that is your home or user folder. The app converts the host path you type, such as `/home/farid/Videos/a.mp4` or `C:\Users\Farid\Videos\a.mp4`, into the matching path inside the container, `/host/Videos/a.mp4`. Paths outside `HOST_ROOT` are rejected with a hint. To limit what the container can access, set `HOST_ROOT` to just your videos folder.
+
+On Linux, new `.srt` files are given the same owner as the video, so they are not owned by root.
+
+### docker compose (alternative)
 
 ```bash
 docker compose build
@@ -57,36 +97,12 @@ docker compose build
 docker compose run --rm srt-translator
 ```
 
-**First run:** a setup wizard asks for the Whisper model, the source and target language, the translation engine, the model name and your API key. The key input is hidden. The settings are saved in the `srt-config` Docker volume, so later runs only ask for the video path. Press Enter to accept `/videos`, or give a single file such as `/videos/drama_ep1.mp4`.
+This shares `HOST_ROOT`, or `$HOME` if `HOST_ROOT` is not set. On Windows, set `HOST_ROOT` first, for example `set HOST_ROOT=%USERPROFILE%`.
 
-**Change settings later:**
-
-```bash
-docker compose run --rm srt-translator --setup
-```
-
-**Process one file directly, without prompts:**
-
-```bash
-docker compose run --rm srt-translator /videos/drama_ep1.mp4
-```
-
-Whisper models download once into the `whisper-models` volume.
-
-If you'd rather not store the API key in the config volume, leave it blank during setup and export it before you run the container:
+If you'd rather not store the API key in the config volume, leave it blank during setup and export it before you start the container:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### Without docker compose
-
-```bash
-docker build -t srt-translator .
-```
-
-```bash
-docker run -it --rm -v "$PWD/videos:/videos" -v srt-config:/config -v whisper-models:/models srt-translator
 ```
 
 ### Using a local Ollama model

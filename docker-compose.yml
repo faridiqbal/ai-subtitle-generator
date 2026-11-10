@@ -1,3 +1,5 @@
+# Alternative to run.sh / run.bat:   docker compose run --rm srt-translator
+# Shares HOST_ROOT (default: your home folder) with the container.
 services:
   srt-translator:
     build: .
@@ -5,11 +7,12 @@ services:
     stdin_open: true   # interactive prompts
     tty: true          # progress bars
     volumes:
-      - ./videos:/videos          # put your videos here; .srt files are written next to them
-      - srt-config:/config        # saved settings from the first-run setup
-      - whisper-models:/models    # Whisper model cache (downloaded once)
-    # Optional: pass API keys from your shell / .env instead of saving them in the config
+      - ${HOST_ROOT:-${HOME}}:/host   # your files; .srt is written next to each video
+      - srt-config:/config            # saved settings from the first-run setup
+      - whisper-models:/models        # Whisper model cache (downloaded once)
     environment:
+      - HOST_ROOT=${HOST_ROOT:-${HOME}}
+      # Optional: pass API keys from your shell / .env instead of saving them
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - GEMINI_API_KEY

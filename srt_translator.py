@@ -365,7 +365,6 @@ class Translator:
 # --------------------------------------------------------------------------- #
 CONFIG_DIR = Path(os.environ.get("SRT_CONFIG_DIR", Path.home() / ".srt-translator"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
-DEFAULT_VIDEO_DIR = os.environ.get("SRT_VIDEO_DIR", "")
 
 DEFAULT_CONFIG = dict(whisper_model="large-v3-turbo", device="auto", source_lang="auto",
                       provider="none", model=None, api_key=None, base_url=None,
@@ -452,12 +451,73 @@ def resolve_api_key(cfg: dict) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Host <-> container path mapping
+# When run in Docker, a folder of the host (HOST_ROOT, e.g. /home/you or
+# C:\\Users\\you) is mounted at HOST_MOUNT (/host). The user types host paths;
+# we translate them to container paths and back for display.
+# --------------------------------------------------------------------------- #
+HOST_ROOT = os.environ.get("HOST_ROOT", "").strip()
+HOST_MOUNT = os.environ.get("HOST_MOUNT", "/host")
+
+
+def _norm(p: str) -> str:
+    """Normalise a host path for prefix comparison (handles Windows paths)."""
+    p = p.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", p):                  # C:/Users -> c:/users
+        p = p.lower()
+    return p.rstrip("/") or "/"
+
+
+def clean_input_path(raw: str) -> str:
+    raw = raw.strip().strip('"').strip("'")
+    if not re.match(r"^[A-Za-z]:[\\/]", raw):          # unix shells escape spaces on drag & drop
+        raw = re.sub(r"\\(.)", r"\1", raw)
+    return raw
+
+
+def to_container_path(raw: str) -> Path | None:
+    raw = clean_input_path(raw)
+    if HOST_ROOT:
+        root, given = _norm(HOST_ROOT), _norm(raw)
+        if given == root or given.startswith(root.rstrip("/") + "/"):
+            rest = raw.replace("\\", "/")[len(root.rstrip("/")):].lstrip("/")
+            return Path(HOST_MOUNT, rest)
+        if raw.startswith("~"):                     # ~/Videos -> HOST_ROOT/Videos
+            return Path(HOST_MOUNT, raw[1:].lstrip("/\\"))
+        if not raw.startswith(HOST_MOUNT):
+            return None                             # outside the shared folder
+    return Path(raw).expanduser()
+
+
+def to_host_path(path: Path) -> str:
+    if HOST_ROOT:
+        try:
+            rest = path.relative_to(HOST_MOUNT)
+        except ValueError:
+            return str(path)
+        sep = "\\" if re.match(r"^[A-Za-z]:", HOST_ROOT) else "/"
+        root = HOST_ROOT.rstrip("/\\")
+        return root + (sep + str(rest).replace("/", sep) if str(rest) != "." else "")
+    return str(path)
+
+
+def match_owner(path: Path, like: Path) -> None:
+    """In Docker we run as root; give new .srt files the video owner's uid/gid."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            st = like.stat()
+            os.chown(path, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def process_video(video: Path, model, translator: Translator | None, cfg: dict,
                   index: int, total: int) -> None:
     out_path = video.with_suffix(".srt")
-    print(f"\n[{index}/{total}] {video}")
+    print(f"\n[{index}/{total}] {to_host_path(video)}")
     if out_path.exists() and not cfg["overwrite"]:
         print(f"  Skipped: {out_path.name} already exists (enable overwrite in --setup).")
         return
@@ -474,7 +534,8 @@ def process_video(video: Path, model, translator: Translator | None, cfg: dict,
         if cfg["keep_original"]:
             orig_path = video.with_suffix(f".{detected}.srt")
             write_srt(segments, orig_path)
-            print(f"  Original subtitles: {orig_path}")
+            match_owner(orig_path, video)
+            print(f"  Original subtitles: {to_host_path(orig_path)}")
         target = cfg["target"]
         if target.lower() in (detected.lower(), lang_name(detected).lower()):
             print(f"  Audio is already in {target}; skipping translation.")
@@ -482,7 +543,32 @@ def process_video(video: Path, model, translator: Translator | None, cfg: dict,
             segments = translator.translate(segments, lang_name(detected), target)
 
     write_srt(segments, out_path)
-    print(f"  Done -> {out_path}")
+    match_owner(out_path, video)
+    print(f"  Done -> {to_host_path(out_path)}")
+
+
+def prompt_for_videos(first: str | None) -> list[Path] | None:
+    """Ask for a host path until it contains videos; None means quit."""
+    hint = f" (inside {HOST_ROOT})" if HOST_ROOT else ""
+    raw = first
+    while True:
+        if not raw:
+            raw = input(f"\nPath to a video file or folder on your computer{hint}\n"
+                        "(drag & drop works; Enter = quit): ").strip()
+            if not raw:
+                return None
+        path = to_container_path(raw)
+        if path is None:
+            print(f"  That path is outside the shared folder {HOST_ROOT}.\n"
+                  "  Restart with HOST_ROOT set to a folder that contains it "
+                  "(see README).")
+        else:
+            videos = collect_videos(path)
+            if videos:
+                print(f"  Found {len(videos)} file(s).")
+                return videos
+            print(f"  No video/audio files found at '{raw}'.")
+        raw = None
 
 
 def main() -> None:
@@ -508,17 +594,6 @@ def main() -> None:
             if not args.path and ask_yes_no("Change settings?", False):
                 cfg = setup_wizard(cfg)
 
-        path_str = args.path
-        while True:
-            if not path_str:
-                path_str = ask("\nVideo file or folder path", DEFAULT_VIDEO_DIR or None)
-            videos = collect_videos(Path(path_str).expanduser())
-            if videos:
-                break
-            print(f"  No video/audio files found at '{path_str}', try again.")
-            path_str = None
-        print(f"  Found {len(videos)} file(s).")
-
         translator = None
         if cfg["provider"] in ("anthropic", "openai", "gemini"):
             api_key = resolve_api_key(cfg)
@@ -527,15 +602,26 @@ def main() -> None:
                          "provider's API key environment variable.")
             translator = Translator(cfg["provider"], api_key or "", cfg["model"],
                                     cfg["base_url"])
-        model = load_whisper(cfg["whisper_model"], cfg["device"])
 
-        overall_start = time.time()
-        for i, video in enumerate(videos, 1):
-            try:
-                process_video(video, model, translator, cfg, i, len(videos))
-            except Exception as exc:
-                print(f"  ERROR processing {video.name}: {exc}")
-        print(f"\nAll done in {(time.time() - overall_start) / 60:.1f} min.")
+        model = None
+        first = args.path
+        while True:
+            videos = prompt_for_videos(first)
+            if not videos:
+                break
+            if model is None:                      # load once, reuse for every file
+                model = load_whisper(cfg["whisper_model"], cfg["device"])
+            started = time.time()
+            for i, video in enumerate(videos, 1):
+                try:
+                    process_video(video, model, translator, cfg, i, len(videos))
+                except Exception as exc:
+                    print(f"  ERROR processing {video.name}: {exc}")
+            print(f"\nFinished in {(time.time() - started) / 60:.1f} min.")
+            if args.path:                          # path given on the command line: one-shot
+                break
+            first = None
+        print("Bye!")
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
 

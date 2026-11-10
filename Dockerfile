@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     SRT_CONFIG_DIR=/config \
     HF_HOME=/models \
-    SRT_VIDEO_DIR=/videos
+    HOST_MOUNT=/host
 
 # ffmpeg decodes the audio track of any video container
 RUN apt-get update \
@@ -18,5 +18,6 @@ RUN pip install -r requirements.txt
 
 COPY srt_translator.py .
 
-VOLUME ["/config", "/models", "/videos"]
+# /host = the folder of your computer shared by run.sh / run.bat
+VOLUME ["/config", "/models"]
 ENTRYPOINT ["python", "/app/srt_translator.py"]
